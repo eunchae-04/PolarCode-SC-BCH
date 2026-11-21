@@ -543,39 +543,43 @@ static int self_check(void)
     return bad;
 }
 
-/* ===================== 메인 ===================== */
-int main(int argc, char **argv)
+/* ===================== 한 케이스 설정 / 해제 ===================== */
+static int setup_case(int Nval, int num, int den, int Lval)
 {
-#ifdef _WIN32
-    SetConsoleOutputCP(65001);      /* 콘솔 출력을 UTF-8로 */
-#endif
-    int argi = 1, check = 0;
-    if (argc > 1 && strcmp(argv[1], "check") == 0) { check = 1; argi = 2; }
-    if (argc - argi < 3) {
-        fprintf(stderr, "사용법: %s [check] N num den [L] [EbN0_start] [EbN0_stop] [step] [max_frames] [target_err] [seed]\n", argv[0]);
+    N = Nval; n = 0; while ((1 << n) < N) n++;
+    if ((1 << n) != N || N > MAXN || Lval < 1 || Lval > MAXL) {
+        fprintf(stderr, "N은 2의 거듭제곱(<=%d), 1<=L<=%d\n", MAXN, MAXL);
         return 1;
     }
-    N = atoi(argv[argi]); int num = atoi(argv[argi + 1]), den = atoi(argv[argi + 2]);
-    int Lval = (argc > argi + 3) ? atoi(argv[argi + 3]) : 8;
-    double e0 = (argc > argi + 4) ? atof(argv[argi + 4]) : 1.0;
-    double e1 = (argc > argi + 5) ? atof(argv[argi + 5]) : 3.0;
-    double es = (argc > argi + 6) ? atof(argv[argi + 6]) : 0.5;
-    long maxf = (argc > argi + 7) ? atol(argv[argi + 7]) : 100000;
-    int  targ = (argc > argi + 8) ? atoi(argv[argi + 8]) : 100;
-    uint64_t seed = (argc > argi + 9) ? (uint64_t)atoll(argv[argi + 9]) : 1;
-    rng_s ^= seed * 0x9E3779B97F4A7C15ULL; for (int i = 0; i < 20; i++) rng_next();
-
-    n = 0; while ((1 << n) < N) n++;
-    if ((1 << n) != N || N > MAXN || Lval < 1 || Lval > MAXL) { fprintf(stderr, "N은 2의 거듭제곱(<=%d), 1<=L<=%d\n", MAXN, MAXL); return 1; }
     Lmax = Lval;
     Kmsg = (int)floor((double)N * num / den + 0.5);
     K = Kmsg + CRC_LEN;
     construct_code();
-    for (int j = 0; j < N; j++) { int r = 0, x = j; for (int b = 0; b < n; b++) { r = (r << 1) | (x & 1); x >>= 1; } bitrev_tab[j] = r; }
+    for (int j = 0; j < N; j++) {
+        int r = 0, x = j;
+        for (int b = 0; b < n; b++) { r = (r << 1) | (x & 1); x >>= 1; }
+        bitrev_tab[j] = r;
+    }
     sc_alloc(); scl_alloc();
+    return 0;
+}
 
-    if (check) return self_check() ? 2 : 0;
+static void teardown_case(void)
+{
+    for (int d = 0; d < n; d++) {
+        free(scL[d]); free(scXl[d]); free(scXr[d]);
+        scL[d] = NULL; scXl[d] = NULL; scXr[d] = NULL;
+    }
+    for (int d = 0; d <= n; d++)
+        for (int s = 0; s < MAXL; s++)
+            if (arrP[d][s]) { free(arrP[d][s]); free(arrC[d][s]); arrP[d][s] = NULL; arrC[d][s] = NULL; }
+    free(pat.bits); free(pat.syn); free(pat.start);
+    memset(&pat, 0, sizeof(pat));
+}
 
+/* ===================== 시뮬레이션 (한 케이스, SNR 구간 전체) ===================== */
+static int run_sim(int num, int den, double e0, double e1, double es, long maxf, int targ)
+{
     printf("N=%d R=%d/%d K=%d (메시지 %d + CRC %d), SCL L=%d\n", N, num, den, K, Kmsg, CRC_LEN, Lmax);
     if (build_patterns(1)) { fprintf(stderr, "패턴 생성 오류\n"); return 2; }
 
@@ -640,6 +644,68 @@ int main(int argc, char **argv)
         fflush(fp); fflush(stdout);
     }
     fclose(fp);
-    printf("결과 저장: %s\n", fname);
+    free(uinfo); free(uh); free(u); free(x); free(llr);
+    printf("결과 저장: %s\n\n", fname);
     return 0;
+}
+
+/* ===================== 메인 ===================== */
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "사용법:\n"
+        "  %s N num den [L] [EbN0_start] [EbN0_stop] [step] [max_frames] [target_err] [seed]   (한 케이스)\n"
+        "  %s all [L] [EbN0_start] [EbN0_stop] [step] [max_frames] [target_err] [seed]         (N=256,512,1024,2048 x R=1/2,1/3 전부)\n"
+        "  %s check N num den                                                                   (자체 검증)\n",
+        prog, prog, prog);
+}
+
+int main(int argc, char **argv)
+{
+#ifdef _WIN32
+    SetConsoleOutputCP(65001);      /* 콘솔 출력을 UTF-8로 */
+#endif
+    if (argc < 2) { usage(argv[0]); return 1; }
+
+    int mode = 0;                   /* 0: 한 케이스, 1: all, 2: check */
+    int argi = 1;
+    if (strcmp(argv[1], "all") == 0) { mode = 1; argi = 2; }
+    else if (strcmp(argv[1], "check") == 0) { mode = 2; argi = 2; }
+
+    int Nval = 0, num = 1, den = 2;
+    if (mode != 1) {
+        if (argc - argi < 3) { usage(argv[0]); return 1; }
+        Nval = atoi(argv[argi]); num = atoi(argv[argi + 1]); den = atoi(argv[argi + 2]);
+        argi += 3;
+    }
+    /* 나머지 인자 (mode 2는 사용하지 않음) */
+    int Lval  = (argc > argi)     ? atoi(argv[argi])     : 8;
+    double e0 = (argc > argi + 1) ? atof(argv[argi + 1]) : (mode == 1 ? 1.0 : 1.0);
+    double e1 = (argc > argi + 2) ? atof(argv[argi + 2]) : (mode == 1 ? 5.0 : 3.0);
+    double es = (argc > argi + 3) ? atof(argv[argi + 3]) : 0.5;
+    long maxf = (argc > argi + 4) ? atol(argv[argi + 4]) : (mode == 1 ? 20000 : 100000);
+    int  targ = (argc > argi + 5) ? atoi(argv[argi + 5]) : 100;
+    uint64_t seed = (argc > argi + 6) ? (uint64_t)atoll(argv[argi + 6]) : 1;
+    rng_s ^= seed * 0x9E3779B97F4A7C15ULL; for (int i = 0; i < 20; i++) rng_next();
+
+    if (mode == 1) {
+        int Ns[4] = {256, 512, 1024, 2048};
+        int Rs[2][2] = {{1, 2}, {1, 3}};
+        for (int a = 0; a < 2; a++) {
+            for (int b = 0; b < 4; b++) {
+                printf("==== 케이스 %d/8 ====\n", a * 4 + b + 1);
+                if (setup_case(Ns[b], Rs[a][0], Rs[a][1], Lval)) return 1;
+                int rc = run_sim(Rs[a][0], Rs[a][1], e0, e1, es, maxf, targ);
+                teardown_case();
+                if (rc) return rc;
+            }
+        }
+        return 0;
+    }
+
+    if (setup_case(Nval, num, den, Lval)) return 1;
+    if (mode == 2) return self_check() ? 2 : 0;
+    int rc = run_sim(num, den, e0, e1, es, maxf, targ);
+    teardown_case();
+    return rc;
 }
